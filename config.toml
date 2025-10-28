@@ -6,18 +6,26 @@ osc_ip = "127.0.0.1"
 osc_port = 57120
 osc_listen_port = 57121
 
+[button_configs.Browse]
+mode = "toggle"
+group_id = 0
+
+[button_configs.Star]
+mode = "toggle"
+group_id = 0
+
+[button_configs.Maschine]
+mode = "toggle"
+group_id = 0
 
 [button_configs.Shift]
 mode = "trigger"
-cc = 23
 
 [button_configs.Play]
 mode = "trigger"
-cc = 24
 
 [button_configs.Stop]
 mode = "trigger"
-cc = 25
 
 [button_configs.Rec]
 mode = "toggle"
