@@ -1,43 +1,35 @@
-use maschine_library::lights::{Brightness, PadColors};
+// crates/driver/src/modes/play_mode.rs
+use maschine_library::lights::Brightness;
 use crate::context::DriverContext;
 use crate::input::HardwareEvent;
 use super::MachineMode;
 
-pub struct PlayMode;
+pub struct PlayMode {}
 
 impl PlayMode {
     pub fn new() -> Self {
-        Self
+        Self {}
     }
 }
 
 impl MachineMode for PlayMode {
     fn on_enter(&mut self, _ctx: &mut DriverContext) {
-        // Setup initial state for Play Mode here if needed
+        // Clear lights or set specific defaults for Play Mode
     }
 
     fn handle_event(&mut self, event: &HardwareEvent, ctx: &mut DriverContext) {
-        match event {
-            HardwareEvent::Button { index, pressed } => {
-                if *pressed {
-                    println!("Play Mode: Button {:?} pressed", index);
-                    // Simple feedback
-                    if ctx.lights.button_has_light(*index) {
-                        ctx.lights.set_button(*index, Brightness::Bright);
-                    }
-                } else {
-                    if ctx.lights.button_has_light(*index) {
-                        ctx.lights.set_button(*index, Brightness::Off);
-                    }
+        if let HardwareEvent::Button { index, pressed } = event {
+            if *pressed {
+                // Visual feedback: Light up on press
+                if ctx.lights.button_has_light(*index) {
+                    ctx.lights.set_button(*index, Brightness::Bright);
+                }
+            } else {
+                // Turn off on release
+                if ctx.lights.button_has_light(*index) {
+                    ctx.lights.set_button(*index, Brightness::Off);
                 }
             }
-            HardwareEvent::Pad { index, event_type: _, value } => {
-                // Simple Pad Feedback (Blue)
-                let is_pressed = *value > 0;
-                let b = if is_pressed { Brightness::Normal } else { Brightness::Off };
-                ctx.lights.set_pad(*index, PadColors::Blue, b);
-            }
-            _ => {}
         }
     }
 }
