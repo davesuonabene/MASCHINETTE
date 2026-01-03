@@ -1,8 +1,8 @@
 // crates/driver/src/main.rs
 mod self_test;
 mod settings;
-// Removed: mod custom_midi; (now in modes/custom_midi.rs)
-// Removed: mod play_mode;   (now in modes/play_mode.rs)
+// Removed: mod custom_midi; (now handled by modes/mod.rs)
+// Removed: mod play_mode;   (now handled by modes/mod.rs)
 mod input;
 mod context;
 mod modes;
@@ -21,7 +21,7 @@ use maschine_library::lights::{Brightness, Lights};
 use maschine_library::screen::Screen;
 use maschine_library::font::Font;
 use midir::MidiOutput;
-use midir::os::unix::VirtualOutput; // FIX: Added this trait for create_virtual
+use midir::os::unix::VirtualOutput; // FIX: Import strictly required for create_virtual
 use rosc::{OscPacket, OscType};
 use rosc::decoder;
 use std::net::{UdpSocket, ToSocketAddrs};
@@ -69,6 +69,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
     osc_listener.set_nonblocking(true)?;
 
     // --- MIDI & HID ---
+    // NOTE: With "jack" feature enabled, this will now attempt to create a native JACK client first.
     let output = MidiOutput::new(&settings.client_name).expect("Couldn't open MIDI output");
     let mut port = output.create_virtual(&settings.port_name).expect("Couldn't create virtual port");
 
@@ -126,7 +127,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
             }
             loop_activity = true;
 
-            // Parse raw bytes into Events using your input.rs logic
+            // Parse raw bytes into Events
             let events = parse_hid_report(&buf[..size]);
 
             for event in events {
