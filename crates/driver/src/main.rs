@@ -1,8 +1,5 @@
-// crates/driver/src/main.rs
 mod self_test;
 mod settings;
-// Removed: mod custom_midi; (now handled by modes/mod.rs)
-// Removed: mod play_mode;   (now handled by modes/mod.rs)
 mod input;
 mod context;
 mod modes;
@@ -15,13 +12,12 @@ use crate::modes::{MachineMode, CustomMidiMode, PlayMode};
 
 use clap::Parser;
 use config::Config;
-// use hidapi::HidDevice; // Removed unused import
 use maschine_library::controls::Buttons;
 use maschine_library::lights::{Brightness, Lights};
 use maschine_library::screen::Screen;
 use maschine_library::font::Font;
 use midir::MidiOutput;
-use midir::os::unix::VirtualOutput; // FIX: Import strictly required for create_virtual
+use midir::os::unix::VirtualOutput;
 use rosc::{OscPacket, OscType};
 use rosc::decoder;
 use std::net::{UdpSocket, ToSocketAddrs};
@@ -60,7 +56,6 @@ fn main() -> Result<(), Box<dyn StdError>> {
     settings.validate().unwrap();
     println!("Running with settings: {:?}", settings);
 
-    // --- OSC INITIALIZATION ---
     let osc_socket = UdpSocket::bind("0.0.0.0:0")?;
     let osc_addr: std::net::SocketAddr = format!("{}:{}", settings.osc_ip, settings.osc_port)
         .to_socket_addrs()?.next().unwrap();
@@ -68,8 +63,6 @@ fn main() -> Result<(), Box<dyn StdError>> {
     let osc_listener = UdpSocket::bind(format!("{}:{}", settings.osc_ip, settings.osc_listen_port))?;
     osc_listener.set_nonblocking(true)?;
 
-    // --- MIDI & HID ---
-    // NOTE: With "jack" feature enabled, this will now attempt to create a native JACK client first.
     let output = MidiOutput::new(&settings.client_name).expect("Couldn't open MIDI output");
     let mut port = output.create_virtual(&settings.port_name).expect("Couldn't create virtual port");
 
@@ -82,7 +75,6 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     self_test(&device, &mut screen, &mut lights)?;
 
-    // --- CONTEXT ---
     let mut context = DriverContext {
         lights: &mut lights,
         midi_port: &mut port,
@@ -95,7 +87,6 @@ fn main() -> Result<(), Box<dyn StdError>> {
     let mut custom_midi = CustomMidiMode::new(&settings);
     let mut play_mode = PlayMode::new();
     
-    // Initial Setup
     println!("Starting in Custom MIDI Mode.");
     context.lights.set_button(Buttons::Maschine, Brightness::Bright);
     context.lights.set_button(Buttons::Star, Brightness::Dim);
@@ -109,11 +100,9 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     loop {
         let mut loop_activity = false;
-        let mut changed_lights = false;
+        let mut should_write_lights = false;
 
-        // --- BATCH HID READ ---
         loop {
-            // Non-blocking read
             let size = match device.read_timeout(&mut buf, 0) {
                 Ok(s) => s,
                 Err(e) => {
@@ -127,12 +116,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
             }
             loop_activity = true;
 
-            // Parse raw bytes into Events
             let events = parse_hid_report(&buf[..size]);
 
             for event in events {
                 match event {
-                    // --- GLOBAL MODE SWITCHING ---
                     HardwareEvent::Button { index: Buttons::Maschine, pressed: true } => {
                         current_mode_id = DriverMode::CustomMidi;
                         
@@ -142,11 +129,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
                         
                         custom_midi.on_enter(&mut context);
                         
-                        // FIX: Changed _screen to screen
                         screen.reset();
                         Font::write_string(&mut screen, 0, 0, "MIDI MODE", 1);
                         screen.write(&device)?;
-                        changed_lights = true;
+                        should_write_lights = true;
                     },
                     HardwareEvent::Button { index: Buttons::Star, pressed: true } => {
                         current_mode_id = DriverMode::Playability;
@@ -157,19 +143,16 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
                         play_mode.on_enter(&mut context);
 
-                        // FIX: Changed _screen to screen
                         screen.reset();
                         Font::write_string(&mut screen, 0, 0, "PLAY MODE", 1);
                         screen.write(&device)?;
-                        changed_lights = true;
+                        should_write_lights = true;
                     },
                     HardwareEvent::Button { index: Buttons::Browse, pressed: true } => {
-                        // Reserved (ignore)
                     },
                     
-                    // --- DELEGATE TO ACTIVE MODE ---
                     _ => {
-                        let mode_changed_lights = match current_mode_id {
+                        let mode_changed = match current_mode_id {
                             DriverMode::CustomMidi => {
                                 let mut mode_ctx = DriverContext {
                                     lights: context.lights,
@@ -193,18 +176,29 @@ fn main() -> Result<(), Box<dyn StdError>> {
                                 true
                             }
                         };
-                        if mode_changed_lights { changed_lights = true; }
+                        if mode_changed { should_write_lights = true; }
                     }
                 }
             }
         }
 
-        // Write lights ONLY once per batch
-        if changed_lights {
+        if current_mode_id == DriverMode::Playability {
+            let mut mode_ctx = DriverContext {
+                lights: context.lights,
+                midi_port: context.midi_port,
+                osc_socket: context.osc_socket,
+                osc_addr: context.osc_addr,
+                settings: context.settings,
+            };
+            if play_mode.tick(&mut mode_ctx) {
+                should_write_lights = true;
+            }
+        }
+
+        if should_write_lights {
             context.lights.write(&device)?;
         }
 
-        // --- OSC LISTENER ---
         loop {
             match osc_listener.recv_from(&mut osc_recv_buf) {
                 Ok((size, _)) => {
@@ -213,7 +207,6 @@ fn main() -> Result<(), Box<dyn StdError>> {
                         if let OscPacket::Message(msg) = packet {
                             if msg.addr == "/maschine/screen/text" {
                                 if let Some(OscType::String(s)) = msg.args.first() {
-                                    // FIX: Changed _screen to screen
                                     screen.reset();
                                     Font::write_string(&mut screen, 0, 0, s, 1);
                                     screen.write(&device)?; 
