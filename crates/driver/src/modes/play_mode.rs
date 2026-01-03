@@ -1,3 +1,4 @@
+// crates/driver/src/modes/play_mode.rs
 use std::time::{Duration, Instant};
 use midly::{live::LiveEvent, MidiMessage};
 use maschine_library::lights::{Brightness, PadColors};
@@ -24,7 +25,8 @@ pub struct PlayMode {
     start_time: Option<Instant>,      // Start of the Initial Recording
     playback_start: Option<Instant>,  // Start of the current loop iteration
     loop_duration: Duration,
-    
+    paused_position: Option<Duration>, // Saved offset for resume
+
     // Data
     events: Vec<SeqEvent>,
     playback_cursor: usize,
@@ -32,6 +34,10 @@ pub struct PlayMode {
     // Visuals
     user_holding: [bool; 16], // Tracks pads physically held by user
     seq_holding: [bool; 16],  // Tracks pads held by sequencer
+    
+    // Button States (for momentary lights)
+    is_restart_pressed: bool,
+    is_erase_pressed: bool,
 }
 
 impl PlayMode {
@@ -43,10 +49,13 @@ impl PlayMode {
             start_time: None,
             playback_start: None,
             loop_duration: Duration::from_millis(0),
+            paused_position: None,
             events: Vec::new(),
             playback_cursor: 0,
             user_holding: [false; 16],
             seq_holding: [false; 16],
+            is_restart_pressed: false,
+            is_erase_pressed: false,
         }
     }
 
@@ -69,11 +78,6 @@ impl PlayMode {
                 self.playback_start = Some(now);
                 self.playback_cursor = 0;
                 elapsed = Duration::from_millis(0);
-                
-                // We do NOT clear lights here anymore to support sustain.
-                // We rely on Seq NoteOff events to clear lights.
-                // However, to be safe against stuck notes at loop boundaries:
-                // (Optional: Logic to handle wrap-around notes would go here)
             }
 
             // Fire Events
@@ -111,6 +115,7 @@ impl PlayMode {
         // Blink logic: On for 500ms, Off for 500ms
         if self.recording {
             let blink_on = (now.elapsed().as_millis() / 500) % 2 == 0;
+            // When blinking off, use Dim to match "half lit when off" request
             let brightness = if blink_on { Brightness::Bright } else { Brightness::Dim };
             ctx.lights.set_button(Buttons::Rec, brightness);
             changed = true;
@@ -131,24 +136,55 @@ impl PlayMode {
     }
 
     fn update_transport_lights(&self, ctx: &mut DriverContext) {
-        // Rec button is handled by tick() blinking if recording
+        // Rec Button Logic:
+        // Always active logic because it's the entry point for creating a loop.
+        // If recording, tick() handles blinking. If not, we set static state here.
         if !self.recording {
             if self.armed {
-                ctx.lights.set_button(Buttons::Rec, Brightness::Dim);
+                ctx.lights.set_button(Buttons::Rec, Brightness::Bright);
             } else {
-                ctx.lights.set_button(Buttons::Rec, Brightness::Off);
+                ctx.lights.set_button(Buttons::Rec, Brightness::Dim); // Dim when idle
             }
         }
 
-        if self.playing {
-            ctx.lights.set_button(Buttons::Play, Brightness::Bright);
-            ctx.lights.set_button(Buttons::Stop, Brightness::Dim);
-        } else {
+        // Other Transport Buttons Logic:
+        if self.loop_duration == Duration::ZERO {
+            // NO LOOP STORED: Everything else OFF
             ctx.lights.set_button(Buttons::Play, Brightness::Off);
-            ctx.lights.set_button(Buttons::Stop, Brightness::Bright); // Bright when stopped
+            ctx.lights.set_button(Buttons::Stop, Brightness::Off);
+            ctx.lights.set_button(Buttons::Restart, Brightness::Off);
+            ctx.lights.set_button(Buttons::Erase, Brightness::Off);
+        } else {
+            // LOOP STORED: Standard Dim/Bright logic
+
+            // Play
+            if self.playing {
+                ctx.lights.set_button(Buttons::Play, Brightness::Bright);
+            } else {
+                ctx.lights.set_button(Buttons::Play, Brightness::Dim);
+            }
+
+            // Stop
+            if !self.playing {
+                ctx.lights.set_button(Buttons::Stop, Brightness::Bright);
+            } else {
+                ctx.lights.set_button(Buttons::Stop, Brightness::Dim);
+            }
+
+            // Restart
+            if self.is_restart_pressed {
+                ctx.lights.set_button(Buttons::Restart, Brightness::Bright);
+            } else {
+                 ctx.lights.set_button(Buttons::Restart, Brightness::Dim);
+            }
+            
+            // Erase
+            if self.is_erase_pressed {
+                ctx.lights.set_button(Buttons::Erase, Brightness::Bright);
+            } else {
+                ctx.lights.set_button(Buttons::Erase, Brightness::Dim);
+            }
         }
-        
-        ctx.lights.set_button(Buttons::Erase, Brightness::Dim);
     }
     
     fn clear_all(&mut self, ctx: &mut DriverContext) {
@@ -157,6 +193,7 @@ impl PlayMode {
         self.armed = false;
         self.start_time = None;
         self.playback_start = None;
+        self.paused_position = None;
         self.loop_duration = Duration::from_millis(0);
         self.events.clear();
         self.playback_cursor = 0;
@@ -179,9 +216,9 @@ impl MachineMode for PlayMode {
     fn handle_event(&mut self, event: &HardwareEvent, ctx: &mut DriverContext) {
         match event {
             HardwareEvent::Button { index, pressed } => {
-                if *pressed {
-                    match index {
-                        Buttons::Rec => {
+                match index {
+                    Buttons::Rec => {
+                        if *pressed {
                             if self.recording {
                                 // STOP RECORDING (Finish Initial or Stop Overdub) -> KEEP PLAYING
                                 if self.loop_duration == Duration::ZERO {
@@ -203,8 +240,10 @@ impl MachineMode for PlayMode {
                                 // ARM (for initial recording)
                                 self.armed = true;
                             }
-                        },
-                        Buttons::Play => {
+                        }
+                    },
+                    Buttons::Play => {
+                        if *pressed {
                             if self.recording && self.loop_duration == Duration::ZERO {
                                 // Finish Initial Rec -> Play
                                 if let Some(start) = self.start_time {
@@ -213,38 +252,96 @@ impl MachineMode for PlayMode {
                                 self.recording = false;
                                 self.playing = true;
                                 self.playback_start = Some(Instant::now());
+                                self.paused_position = None;
                             } else if self.playing {
-                                // Stop/Pause
+                                // PAUSE
                                 self.playing = false;
-                                self.recording = false;
-                                // Turn off sequencer lights
+                                self.recording = false; // Stop recording if we pause
+                                
+                                // Calculate where we paused relative to loop start
+                                if let Some(start) = self.playback_start {
+                                    let elapsed = Instant::now().duration_since(start);
+                                    let pos = if self.loop_duration > Duration::ZERO {
+                                        let millis = elapsed.as_millis() % self.loop_duration.as_millis();
+                                        Duration::from_millis(millis as u64)
+                                    } else {
+                                        Duration::ZERO
+                                    };
+                                    self.paused_position = Some(pos);
+                                }
+                                
+                                // Turn off sequencer lights as we paused
                                 self.seq_holding = [false; 16];
                                 for i in 0..16 {
                                     self.update_pad_light(ctx, i);
                                 }
                             } else if self.loop_duration > Duration::ZERO {
-                                // Start Playing existing loop
+                                // RESUME
                                 self.playing = true;
-                                self.playback_start = Some(Instant::now());
+                                
+                                let offset = self.paused_position.unwrap_or(Duration::ZERO);
+                                // Set playback start in the past so that (now - start) == offset
+                                self.playback_start = Some(Instant::now() - offset);
+                                
+                                // Re-sync cursor
                                 self.playback_cursor = 0;
+                                for (i, event) in self.events.iter().enumerate() {
+                                    // We look for the first event that hasn't happened yet relative to offset
+                                    if event.offset > offset {
+                                        self.playback_cursor = i;
+                                        break;
+                                    }
+                                    // Handle exact match if necessary, mostly covered by loop logic
+                                    if event.offset == offset {
+                                        self.playback_cursor = i;
+                                        break;
+                                    }
+                                    // If we are past the event, move cursor forward
+                                    self.playback_cursor = i + 1;
+                                }
                             }
-                        },
-                        Buttons::Stop => {
+                        }
+                    },
+                    Buttons::Stop => {
+                        if *pressed {
                              self.playing = false;
                              self.recording = false;
                              self.armed = false;
+                             
+                             // Reset position to Start
+                             self.paused_position = Some(Duration::ZERO);
+                             self.playback_cursor = 0;
+                             
                              self.seq_holding = [false; 16];
                              for i in 0..16 {
                                 self.update_pad_light(ctx, i);
                              }
-                        },
-                        Buttons::Erase => {
+                        }
+                    },
+                    Buttons::Restart => {
+                        self.is_restart_pressed = *pressed;
+                        if *pressed {
+                            // Restart Loop logic
+                            if self.playing {
+                                self.playback_start = Some(Instant::now());
+                                self.playback_cursor = 0;
+                            }
+                            // Reset position regardless
+                            self.paused_position = Some(Duration::ZERO);
+                            if !self.playing {
+                                self.playback_cursor = 0;
+                            }
+                        }
+                    },
+                    Buttons::Erase => {
+                        self.is_erase_pressed = *pressed;
+                        if *pressed {
                             self.clear_all(ctx);
-                        },
-                        _ => {}
-                    }
-                    self.update_transport_lights(ctx);
+                        }
+                    },
+                    _ => {}
                 }
+                self.update_transport_lights(ctx);
             },
             HardwareEvent::Pad { index, event_type, value } => {
                 let note = ctx.settings.notemaps[*index];
@@ -316,10 +413,6 @@ impl MachineMode for PlayMode {
                         
                         let is_note_on = matches!(event_type, PadEventType::NoteOn | PadEventType::PressOn);
                         if is_note_on || matches!(event_type, PadEventType::NoteOff | PadEventType::PressOff) {
-                            // Insert sorted? Or just append and sort later?
-                            // For simplicity, append. If we append out of order in Overdub, 
-                            // the tick loop might miss it if cursor passed, but it will catch it next loop.
-                            // Ideally we sort events by offset.
                             self.events.push(SeqEvent {
                                 offset,
                                 note,
