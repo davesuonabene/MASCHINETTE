@@ -1,3 +1,4 @@
+// crates/maschine_library/src/lights.rs
 use crate::controls::Buttons;
 use hidapi::{HidDevice, HidResult};
 use num_derive::FromPrimitive;
@@ -91,7 +92,11 @@ impl Lights {
     }
 
     pub fn write(&self, h: &HidDevice) -> HidResult<()> {
-        h.write(&[&[0x80u8] as &[u8], &self.status].concat())?;
+        // OPTIMIZATION: Use a fixed buffer on the stack to avoid heap allocation (Vec)
+        let mut report = [0u8; 81];
+        report[0] = 0x80; // Report ID
+        report[1..].copy_from_slice(&self.status);
+        h.write(&report)?;
 
         Ok(())
     }

@@ -1,3 +1,4 @@
+// crates/driver/src/main.rs
 mod self_test;
 mod settings;
 mod custom_midi;
@@ -24,6 +25,8 @@ use rosc::decoder;
 use std::net::{UdpSocket, ToSocketAddrs};
 use std::error::Error as StdError;
 use std::io::ErrorKind;
+use std::time::Duration;
+use std::thread;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum DriverMode {
@@ -69,7 +72,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     let api = hidapi::HidApi::new()?;
     let device = api.open(0x17cc, 0x1700)?;
-    device.set_blocking_mode(false)?;
+    device.set_blocking_mode(false)?; // Ensure non-blocking at API level
 
     let mut screen = Screen::new();
     let mut lights = Lights::new();
@@ -118,11 +121,21 @@ fn main_loop(
     let mut osc_recv_buf = [0u8; 1024]; 
     
     loop {
-        let size = device.read_timeout(&mut buf, 10)?;
+        let mut loop_activity = false;
         let mut changed_lights = false;
+
+        // --- BATCH HID READ ---
+        // Drain the OS buffer completely before processing anything else.
+        // This prevents stuck notes caused by slow writes blocking reads.
+        loop {
+            // Read with 0 timeout (non-blocking)
+            let size = device.read_timeout(&mut buf, 0)?;
+            
+            if size == 0 {
+                break;
+            }
+            loop_activity = true;
         
-        if size > 0 {
-            // --- HID DEVICE INPUT ---
             if buf[0] == 0x01 {
                 // BUTTONS
                 for i in 0..6 {
@@ -138,33 +151,30 @@ fn main_loop(
                         let is_pressed = (buf[i + 1] & (1 << j)) > 0;
                         
                         // --- RESERVED BUTTONS (MODE SWITCHING) ---
-                        // We intercept these BEFORE passing them to mode handlers
                         if button == Buttons::Maschine {
                             if is_pressed {
                                 current_mode = DriverMode::CustomMidi;
-                                println!("Mode Switched: Custom MIDI");
+                                // println!("Mode Switched: Custom MIDI"); // REMOVED
                                 
-                                // Set Mode Indicators
                                 lights.set_button(Buttons::Maschine, Brightness::Bright);
                                 lights.set_button(Buttons::Star, Brightness::Dim);
                                 lights.set_button(Buttons::Browse, Brightness::Dim);
                                 
-                                // Restore lights for this mode
                                 custom_midi.refresh(lights);
                                 
-                                // Screen Update
+                                // Screen Update - careful, this is slow, but acceptable on mode switch
                                 _screen.reset();
                                 Font::write_string(_screen, 0, 0, "MIDI MODE", 1);
                                 _screen.write(device)?;
                                 changed_lights = true;
                             }
-                            continue; // Do NOT pass to mode handler
+                            continue;
                         }
 
                         if button == Buttons::Star {
                             if is_pressed {
                                 current_mode = DriverMode::Playability;
-                                println!("Mode Switched: Playability");
+                                // println!("Mode Switched: Playability"); // REMOVED
                                 
                                 lights.set_button(Buttons::Star, Brightness::Bright);
                                 lights.set_button(Buttons::Maschine, Brightness::Dim);
@@ -177,15 +187,12 @@ fn main_loop(
                                 _screen.write(device)?;
                                 changed_lights = true;
                             }
-                            continue; // Do NOT pass to mode handler
+                            continue;
                         }
 
                         if button == Buttons::Browse {
-                            // Reserved button - consume event
-                            if is_pressed {
-                                println!("Reserved Button (Browse) Pressed");
-                            }
-                            continue; // Do NOT pass to mode handler
+                             // Reserved button - consume event
+                             continue; 
                         }
                         // --- END RESERVED BUTTONS ---
 
@@ -205,7 +212,7 @@ fn main_loop(
                     }
                 }
                 
-                // ENCODER & SLIDER (Currently assigned to Custom Midi)
+                // ENCODER & SLIDER
                 if current_mode == DriverMode::CustomMidi {
                     custom_midi.handle_encoder(buf[7], osc_socket, osc_addr);
                     if custom_midi.handle_slider(buf[10], lights, osc_socket, osc_addr) {
@@ -214,7 +221,7 @@ fn main_loop(
                 }
 
             } else if buf[0] == 0x02 {
-                // PADS (Shared Logic for now)
+                // PADS
                 for i in (1..buf.len()).step_by(3) {
                     let idx = buf[i];
                     let evt = buf[i + 1] & 0xf0;
@@ -227,6 +234,8 @@ fn main_loop(
                         PadEventType::NoteOn | PadEventType::PressOn | PadEventType::Aftertouch if val > 0 => Brightness::Normal,
                         _ => Brightness::Off,
                     };
+                    
+                    // Only update lights if actually changed to prevent excessive USB writes
                     if prev_b != b {
                         lights.set_pad(idx as usize, PadColors::Blue, b);
                         changed_lights = true;
@@ -244,36 +253,56 @@ fn main_loop(
 
                     if let Some(evt) = event {
                         let l_ev = LiveEvent::Midi { channel: 0.into(), message: evt };
-                        let mut midibuf = Vec::new();
-                        if l_ev.write(&mut midibuf).is_ok() {
-                            let _ = port.send(&midibuf[..]);
+                        // Optimize: use stack buffer for midi encoding
+                        let mut midibuf = [0u8; 3]; 
+                        // Using a small vec or slice directly with midly if possible, but 3 bytes is typical max for note on/off
+                        let mut vec_buf = Vec::with_capacity(3); // Fallback to vec as `write` needs `std::io::Write`
+                        if l_ev.write(&mut vec_buf).is_ok() {
+                            let _ = port.send(&vec_buf);
                         }
                     }
                 }
             }
+        } // End of HID Drain Loop
+
+        // Write lights ONLY once per batch if needed
+        if changed_lights {
+            lights.write(device)?;
         }
         
-        // OSC LISTENER
-        match osc_listener.recv_from(&mut osc_recv_buf) {
-            Ok((size, _)) => {
-                if let Ok((_, packet)) = decoder::decode_udp(&osc_recv_buf[..size]) {
-                    if let OscPacket::Message(msg) = packet {
-                         if msg.addr == "/maschine/screen/text" {
-                            if let Some(OscType::String(s)) = msg.args.first() {
-                                _screen.reset();
-                                Font::write_string(_screen, 0, 0, s, 1);
-                                _screen.write(device)?;
+        // --- OSC LISTENER ---
+        // Quick check, non-blocking
+        loop {
+            match osc_listener.recv_from(&mut osc_recv_buf) {
+                Ok((size, _)) => {
+                    loop_activity = true;
+                    if let Ok((_, packet)) = decoder::decode_udp(&osc_recv_buf[..size]) {
+                        if let OscPacket::Message(msg) = packet {
+                             if msg.addr == "/maschine/screen/text" {
+                                if let Some(OscType::String(s)) = msg.args.first() {
+                                    _screen.reset();
+                                    Font::write_string(_screen, 0, 0, s, 1);
+                                    _screen.write(device)?; // This is slow, but infrequent
+                                }
                             }
                         }
                     }
+                },
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    break; // No more OSC messages
                 }
-            },
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => eprintln!("OSC error: {}", e),
+                Err(e) => {
+                    eprintln!("OSC error: {}", e);
+                    break;
+                },
+            }
         }
 
-        if changed_lights {
-            lights.write(device)?;
+        // --- IDLE SLEEP ---
+        // If we did absolutely nothing this frame (no HID, no OSC), sleep a tiny bit to save CPU.
+        // If we processed HID, we loop immediately to catch the next burst.
+        if !loop_activity {
+            thread::sleep(Duration::from_millis(1));
         }
     }
 }
